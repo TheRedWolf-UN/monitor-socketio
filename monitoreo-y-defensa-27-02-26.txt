@@ -1,0 +1,305 @@
+Código del backend: app.py
+
+
+import eventlet
+eventlet.monkey_patch()
+
+from flask import Flask, render_template
+from flask_socketio import SocketIO
+import socketio as sio_client
+import time
+
+BASE_URL = "http://192.168.0.252:"
+BASE_PORT = 44111
+NUM_SERVERS = 40
+TEMP_PORT = 44120
+
+app = Flask(__name__)
+socketio = SocketIO(app, cors_allowed_origins="*", async_mode="eventlet")
+
+state = {}
+cpu_temp = None
+
+def server_worker(idx, port):
+    sio = sio_client.Client()
+
+    @sio.on("new_hit")
+    def on_hit():
+        state[idx]["count"] += 1
+        socketio.emit("update", {
+            "idx": idx,
+            "count": state[idx]["count"]
+        })
+
+    while True:
+        try:
+            sio.connect(f"{BASE_URL}{port}")
+            state[idx] = {"count": 0}
+            socketio.emit("init", {
+                "servers": state,
+                "cpu_temp": cpu_temp
+            })
+            sio.wait()
+        except:
+            state.pop(idx, None)
+            socketio.emit("init", {
+                "servers": state,
+                "cpu_temp": cpu_temp
+            })
+            eventlet.sleep(2)
+
+def temp_worker():
+    sio = sio_client.Client()
+
+    @sio.on("cpu_temp")
+    def on_temp(data):
+        global cpu_temp
+        cpu_temp = data.get("temp")
+        socketio.emit("cpu_temp", {"value": cpu_temp})
+
+    while True:
+        try:
+            sio.connect(f"{BASE_URL}{TEMP_PORT}")
+            sio.wait()
+        except:
+            eventlet.sleep(2)
+
+@app.route("/")
+def index():
+    return render_template("index.html")
+
+@socketio.on("connect")
+def on_connect():
+    socketio.emit("init", {
+        "servers": state,
+        "cpu_temp": cpu_temp
+    })
+
+if __name__ == "__main__":
+    for i in range(NUM_SERVERS):
+        socketio.start_background_task(
+            server_worker,
+            i,
+            BASE_PORT + i
+        )
+
+    socketio.start_background_task(temp_worker)
+
+    socketio.run(app, host="0.0.0.0", port=50100)
+
+
+
+
+
+
+
+# Código del frontend
+<!doctype html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <title>Monitor</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <script src="https://cdn.socket.io/4.7.5/socket.io.min.js"></script>
+    <style>
+        body {
+            margin: 0;
+            background: radial-gradient(circle at top, #0f172a, #020617);
+            color: #e5e7eb;
+            font-family: system-ui, sans-serif;
+        }
+        .top {
+            text-align: center;
+            padding: 16px;
+            font-weight: 700;
+            letter-spacing: 0.08em;
+        }
+        .temp {
+            color: #22d3ee;
+        }
+        .grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(130px, 1fr));
+            gap: 14px;
+            padding: 14px;
+        }
+        .card {
+            background: #020617;
+            border: 1px solid #1e293b;
+            border-radius: 12px;
+            padding: 12px;
+            text-align: center;
+        }
+        .label {
+            font-weight: 700;
+            font-size: 0.9rem;
+            margin-bottom: 6px;
+        }
+        .led {
+            width: 22px;
+            height: 22px;
+            border-radius: 50%;
+            background: #020617;
+            margin: 10px auto;
+        }
+        .led.on {
+            background: #22c55e;
+            box-shadow: 0 0 14px #22c55e;
+        }
+        .count {
+            font-size: 0.85rem;
+            color: #94a3b8;
+        }
+        .sound {
+            margin-top: 8px;
+            font-size: 0.75rem;
+            cursor: pointer;
+            color: #38bdf8;
+        }
+        .sound.active {
+            color: #22c55e;
+        }
+    </style>
+</head>
+<body>
+
+<div class="top">
+    MONITOR |
+    CPU <span class="temp" id="cpu_temp">--</span> °C
+    <div id="soundBtn" class="sound">ACTIVAR SONIDO</div>
+</div>
+
+<div id="grid" class="grid"></div>
+
+<audio id="beep">
+    <source src="/static/beep.mp3" type="audio/mpeg">
+</audio>
+
+<script>
+    const socket = io();
+    const grid = document.getElementById("grid");
+    const tempEl = document.getElementById("cpu_temp");
+    const beep = document.getElementById("beep");
+    const soundBtn = document.getElementById("soundBtn");
+
+    let soundEnabled = false;
+
+    const labels = {
+        0: "tarea1",
+        1: "tarea2",
+        2: "tarea3",
+        3: "tarea4"
+    };
+
+    soundBtn.onclick = () => {
+        beep.play().then(() => {
+            beep.pause();
+            beep.currentTime = 0;
+            soundEnabled = true;
+            soundBtn.classList.add("active");
+            soundBtn.innerText = "SONIDO ACTIVO";
+        });
+    };
+
+    socket.on("init", data => {
+        grid.innerHTML = "";
+
+        for (const [idx, srv] of Object.entries(data.servers)) {
+            const i = Number(idx);
+            const label = labels[i] ?? `Server${i + 1}`;
+
+            const card = document.createElement("div");
+            card.className = "card";
+            card.innerHTML = `
+                <div class="label">${label}</div>
+                <div id="led${i}" class="led"></div>
+                <div id="cnt${i}" class="count">${srv.count}</div>
+            `;
+            grid.appendChild(card);
+        }
+
+        if (data.cpu_temp !== null) {
+            tempEl.innerText = data.cpu_temp.toFixed(1);
+        }
+    });
+
+    socket.on("update", data => {
+        const led = document.getElementById("led" + data.idx);
+        const cnt = document.getElementById("cnt" + data.idx);
+        if (!led || !cnt) return;
+
+        cnt.innerText = data.count;
+        led.classList.add("on");
+
+        if (soundEnabled) {
+            beep.currentTime = 0;
+            beep.play();
+        }
+
+        setTimeout(() => led.classList.remove("on"), 80);
+    });
+
+    socket.on("cpu_temp", data => {
+        if (data.value !== null) {
+            tempEl.innerText = data.value.toFixed(1);
+        }
+    });
+</script>
+
+</body>
+</html>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# Código para crear una API: Este código permite
+# enviar por socketio en tiempo real cuando un archivo
+# de log se ha modoficado para poder avisar oportunamente
+# a este sistema:
+
+from flask import Flask
+from flask_socketio import SocketIO
+import os
+import time
+
+LOG_FILE = "~/Servicios/tarea1/tarea1.txt"
+
+app = Flask(__name__)
+socketio = SocketIO(app, cors_allowed_origins="*", async_mode="eventlet")
+
+def watch_log():
+    try:
+        last_mtime = os.path.getmtime(LOG_FILE)
+    except:
+        last_mtime = 0
+
+    while True:
+        try:
+            mtime = os.path.getmtime(LOG_FILE)
+            if mtime != last_mtime:
+                last_mtime = mtime
+                socketio.emit("new_hit")
+                print (f"New hit ...")
+        except:
+            pass
+
+        socketio.sleep(0.1)
+
+@socketio.on("connect")
+def connect():
+    print("cliente conectado")
+
+if __name__ == "__main__":
+    print ( f"Iniciando servidor ..." )
+    socketio.start_background_task(watch_log)
+    socketio.run(app, host="0.0.0.0", port=44119)
